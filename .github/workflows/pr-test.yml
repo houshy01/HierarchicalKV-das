@@ -123,6 +123,7 @@ jobs:
     container:
       image: ${{ vars[matrix.image] }}
     steps:
+      # 下载与当前 DTK 镜像版本匹配的编译产物。
       - name: Download test executables
         uses: actions/download-artifact@v4
         with:
