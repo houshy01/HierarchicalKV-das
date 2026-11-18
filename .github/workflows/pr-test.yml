@@ -17,9 +17,14 @@ defaults:
   run:
     shell: bash
 
+concurrency:
+  # 无关标签触发的运行不取消正在进行的编译或测试。
+  group: hierarchicalkv-pr-test-${{ (github.event.action == 'labeled' && github.event.label.name != 'ready-hcu') && github.run_id || github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Build and Test (BW1000 / DTK2604)
+  build:
+    name: K8s build (DTK${{ matrix.dtk }})
     # 沿用 spconv-das：外部 fork 仅在维护者打 ready-hcu 标签的当次运行。
     # 后续新提交需复核、移除并重新打标签。
     if: >-
@@ -27,23 +32,18 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository ||
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) ||
        github.event.action == 'labeled')
-    concurrency:
-      group: hierarchicalkv-pr-test-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
-    runs-on:
-      group: ci-general
-      labels: [self-hosted, ci, bw1000]
+    runs-on: hygon-build
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk: "2604"
+            image: BASE_IMAGE_UBUNTU_DTK2604_PY310
+          - dtk: "2610"
+            image: BASE_IMAGE_UBUNTU_DTK2610_PY312
     container:
-      # 已包含 DTK，无需安装 DTK、torch 或打包工具。
-      image: ${{ vars.BASE_IMAGE_UBUNTU_DTK2604_PY310 }}
-      volumes:
-        - /opt/hyhal/:/opt/hyhal/:ro
-      options: >-
-        --device=/dev/kfd
-        --device=/dev/dri
-        --group-add=video
-        --shm-size=16g
+      image: ${{ vars[matrix.image] }}
     steps:
       - name: Checkout base branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -78,8 +78,56 @@ jobs:
           set -eo pipefail
           source /opt/dtk/env.sh
           set -u
-          cmake -S . -B build -G "Unix Makefiles"
+          # 编译 runner 无需 GPU，显式指定 BW1000 架构供 CMake 配置使用。
+          cmake -S . -B build -G "Unix Makefiles" -DCMAKE_HIP_ARCHITECTURES=gfx936
           make -C build -j32
+
+      - name: Package test executables
+        run: |
+          set -euo pipefail
+          cd build
+          # 用 tar 保留 Linux 可执行权限。
+          shopt -s nullglob
+          tests=(*_test)
+          test "${#tests[@]}" -gt 0
+          tar -czf hierarchicalkv-tests.tar.gz -- "${tests[@]}"
+
+      - name: Upload test executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: hierarchicalkv-tests-dtk${{ matrix.dtk }}
+          path: build/hierarchicalkv-tests.tar.gz
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Clean build directory
+        if: always()
+        run: |
+          # 在容器退出前清理可能归 root 所有的构建文件。
+          rm -rf -- "${GITHUB_WORKSPACE:?}/build"
+
+  test:
+    name: K8s BW1000 single-card test (DTK${{ matrix.dtk }})
+    needs: build
+    runs-on: hygon-bw1000-1card
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk: "2604"
+            image: BASE_IMAGE_UBUNTU_DTK2604_PY310
+          - dtk: "2610"
+            image: BASE_IMAGE_UBUNTU_DTK2610_PY312
+    container:
+      image: ${{ vars[matrix.image] }}
+    steps:
+      - name: Download test executables
+        uses: actions/download-artifact@v4
+        with:
+          name: hierarchicalkv-tests-dtk${{ matrix.dtk }}
+          path: build
 
       - name: Run all 16 test programs
         run: |
@@ -87,6 +135,7 @@ jobs:
           source /opt/dtk/env.sh
           set -u
           cd build
+          tar -xzf hierarchicalkv-tests.tar.gz
           # 串行执行以减少显存争用，不运行 benchmark。
           tests=(
             accum_or_assign_test
